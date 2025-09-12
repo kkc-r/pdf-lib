@@ -4,6 +4,8 @@ import PDFName from './objects/PDFName';
 import PDFObject from './objects/PDFObject';
 import PDFRef from './objects/PDFRef';
 import PDFStream from './objects/PDFStream';
+import PDFString from './objects/PDFString';
+import PDFInvalidObject from './objects/PDFInvalidObject';
 import PDFContext from './PDFContext';
 import PDFPageLeaf from './structures/PDFPageLeaf';
 
@@ -43,12 +45,13 @@ class PDFObjectCopier {
 
   // prettier-ignore
   copy = <T extends PDFObject>(object: T): T => (
-      object instanceof PDFPageLeaf ? this.copyPDFPage(object)
-    : object instanceof PDFDict     ? this.copyPDFDict(object)
-    : object instanceof PDFArray    ? this.copyPDFArray(object)
-    : object instanceof PDFStream   ? this.copyPDFStream(object)
-    : object instanceof PDFRef      ? this.copyPDFIndirectObject(object)
-    : object.clone()
+    object instanceof PDFPageLeaf ? this.copyPDFPage(object)
+      : object instanceof PDFDict ? this.copyPDFDict(object)
+        : object instanceof PDFArray ? this.copyPDFArray(object)
+          : object instanceof PDFStream ? this.copyPDFStream(object)
+            : object instanceof PDFRef ? this.copyPDFIndirectObject(object)
+              : object instanceof PDFInvalidObject ? this.copyPDFInvalidObject(object)
+                : object.clone()
   ) as T;
 
   private copyPDFPage = (originalPage: PDFPageLeaf): PDFPageLeaf => {
@@ -83,7 +86,17 @@ class PDFObjectCopier {
 
     for (let idx = 0, len = entries.length; idx < len; idx++) {
       const [key, value] = entries[idx];
-      clonedDict.set(key, this.copy(value));
+
+      // Special handling for CIDSystemInfo in CIDFont objects
+      if (
+        this.isCIDFontDict(originalDict) &&
+        key.toString() === '/CIDSystemInfo'
+      ) {
+        const fixedCIDSystemInfo = this.getFixedCIDSystemInfo(value);
+        clonedDict.set(key, fixedCIDSystemInfo);
+      } else {
+        clonedDict.set(key, this.copy(value));
+      }
     }
 
     return clonedDict;
@@ -133,10 +146,128 @@ class PDFObjectCopier {
       if (dereferencedValue) {
         const cloned = this.copy(dereferencedValue);
         this.dest.assign(newRef, cloned);
+
+        // Debug logging for font-related objects
+        /*
+        if (process.env.DEBUG_FONT_COPY === '1') {
+          if (dereferencedValue instanceof PDFDict) {
+            const type = dereferencedValue.get(PDFName.of('Type'));
+            const subtype = dereferencedValue.get(PDFName.of('Subtype'));
+            if (
+              type &&
+              (type.toString() === '/Font' ||
+                (subtype && subtype.toString().includes('Font')))
+            ) {
+              console.log(
+                `Font object copied: ${ref.toString()} -> ${newRef.toString()}`,
+              );
+              console.log(
+                `  Original type: ${dereferencedValue.constructor.name}`,
+              );
+              console.log(`  Cloned type: ${cloned.constructor.name}`);
+            }
+          }
+        }
+        */
+      } else {
+        // If the referenced object doesn't exist in source,
+        // assign null to prevent broken references in destination
+        this.dest.assign(newRef, this.dest.obj(null));
+
+        /*
+        if (process.env.DEBUG_FONT_COPY === '1') {
+          console.log(`Missing object: ${ref.toString()} -> assigned null`);
+        }
+        */
       }
     }
 
     return this.traversedObjects.get(ref) as PDFRef;
+  };
+
+  private isCIDFontDict = (dict: PDFDict): boolean => {
+    const type = dict.get(PDFName.of('Type'));
+    const subtype = dict.get(PDFName.of('Subtype'));
+
+    return !!(
+      type &&
+      type.toString() === '/Font' &&
+      subtype &&
+      (subtype.toString() === '/CIDFontType0' ||
+        subtype.toString() === '/CIDFontType2')
+    );
+  };
+
+  private getFixedCIDSystemInfo = (
+    originalCIDSystemInfo: PDFObject,
+  ): PDFObject => {
+    // If it's not a PDFDict, create a new clean one
+    if (!(originalCIDSystemInfo instanceof PDFDict)) {
+      /*
+      if (process.env.DEBUG_FONT_COPY === '1') {
+        console.log('CIDSystemInfo is not a PDFDict, creating new one');
+      }
+      */
+      return this.dest.obj({
+        Registry: PDFString.of('Adobe'),
+        Ordering: PDFString.of('Identity'),
+        Supplement: 0,
+      });
+    }
+
+    // Check if the existing CIDSystemInfo has corrupted strings
+    const registry = originalCIDSystemInfo.get(PDFName.of('Registry'));
+    const ordering = originalCIDSystemInfo.get(PDFName.of('Ordering'));
+
+    if (registry && ordering) {
+      const registryStr = registry.toString();
+      const orderingStr = ordering.toString();
+
+      // If strings are corrupted/encrypted, create a new clean CIDSystemInfo
+      if (
+        this.hasNonAsciiChars(registryStr) ||
+        this.hasNonAsciiChars(orderingStr)
+      ) {
+        /*
+        if (process.env.DEBUG_FONT_COPY === '1') {
+          console.log('Fixing corrupted CIDSystemInfo strings');
+        }
+        */
+        return this.dest.obj({
+          Registry: PDFString.of('Adobe'),
+          Ordering: PDFString.of('Identity'),
+          Supplement: 0,
+        });
+      }
+    }
+
+    // If CIDSystemInfo is clean, copy it normally
+    return this.copy(originalCIDSystemInfo);
+  };
+
+  private hasNonAsciiChars = (str: string): boolean => {
+    // Check if string contains non-ASCII characters (which would indicate encryption/corruption)
+    // Skip parentheses at the beginning and end which are PDF string delimiters
+    let cleanStr = str;
+    if (str.startsWith('(') && str.endsWith(')')) {
+      cleanStr = str.slice(1, -1);
+    }
+
+    for (let i = 0; i < cleanStr.length; i++) {
+      const code = cleanStr.charCodeAt(i);
+      if (code > 127 || code < 32) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  private copyPDFInvalidObject = (
+    invalidObject: PDFInvalidObject,
+  ): PDFInvalidObject => {
+    // For PDFInvalidObject, we should try to copy it as-is
+    // This preserves the original data even if it couldn't be parsed properly
+    return invalidObject.clone();
   };
 }
 
