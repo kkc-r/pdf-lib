@@ -141,16 +141,18 @@ class CustomFontEmbedder {
   protected async embedCIDFontDict(context: PDFContext): Promise<PDFRef> {
     const fontDescriptorRef = await this.embedFontDescriptor(context);
 
+    const cidSystemInfo = context.obj({
+      Registry: PDFString.of('Adobe'),
+      Ordering: PDFString.of('Identity'),
+      Supplement: 0,
+    });
+
     const cidFontDict = context.obj({
       Type: 'Font',
       Subtype: this.isCFF() ? 'CIDFontType0' : 'CIDFontType2',
       CIDToGIDMap: 'Identity',
       BaseFont: this.baseFontName,
-      CIDSystemInfo: {
-        Registry: PDFString.of('Adobe'),
-        Ordering: PDFString.of('Identity'),
-        Supplement: 0,
-      },
+      CIDSystemInfo: cidSystemInfo,
       FontDescriptor: fontDescriptorRef,
       W: this.computeWidths(),
     });
